@@ -521,8 +521,15 @@ def make_custom_fields(update=True):
 		'Address': [
 			dict(fieldname='gstin', label='Party GSTIN', fieldtype='Data',
 				insert_after='fax'),
+			dict(fieldname='gst_category',label='GST Category',fieldtype='Select', insert_after='gstin',
+				options='Registered Regular\nRegistered Composition\nUnregistered\nSEZ\nOverseas\nConsumer\nDeemed Export\nUIN Holders',
+				default='Unregistered'),
+			dict(fieldname='export_type', label='Export Type', fieldtype='Select', insert_after='gst_category',
+				depends_on='eval:in_list(["SEZ", "Overseas", "Deemed Export"], doc.gst_category)',
+				options='\nWith Payment of Tax\nWithout Payment of Tax',
+				mandatory_depends_on='eval:in_list(["SEZ", "Overseas", "Deemed Export"], doc.gst_category)'),
 			dict(fieldname='gst_state', label='GST State', fieldtype='Select',
-				options='\n'.join(states), insert_after='gstin'),
+				options='\n'.join(states), insert_after='export_type'),
 			dict(fieldname='gst_state_number', label='GST State Number',
 				fieldtype='Data', insert_after='gst_state', read_only=1),
 		],
@@ -655,42 +662,6 @@ def make_custom_fields(update=True):
 				'fieldtype': 'Data',
 				'insert_after': 'supplier_type',
 				'depends_on': 'eval:doc.is_transporter'
-			},
-			{
-				'fieldname': 'gst_category',
-				'label': 'GST Category',
-				'fieldtype': 'Select',
-				'insert_after': 'gst_transporter_id',
-				'options': 'Registered Regular\nRegistered Composition\nUnregistered\nSEZ\nOverseas\nUIN Holders',
-				'default': 'Unregistered'
-			},
-			{
-				'fieldname': 'export_type',
-				'label': 'Export Type',
-				'fieldtype': 'Select',
-				'insert_after': 'gst_category',
-				'depends_on':'eval:in_list(["SEZ", "Overseas"], doc.gst_category)',
-				'options': '\nWith Payment of Tax\nWithout Payment of Tax',
-				'mandatory_depends_on': 'eval:in_list(["SEZ", "Overseas"], doc.gst_category)'
-			}
-		],
-		'Customer': [
-			{
-				'fieldname': 'gst_category',
-				'label': 'GST Category',
-				'fieldtype': 'Select',
-				'insert_after': 'customer_type',
-				'options': 'Registered Regular\nRegistered Composition\nUnregistered\nSEZ\nOverseas\nConsumer\nDeemed Export\nUIN Holders',
-				'default': 'Unregistered'
-			},
-			{
-				'fieldname': 'export_type',
-				'label': 'Export Type',
-				'fieldtype': 'Select',
-				'insert_after': 'gst_category',
-				'depends_on':'eval:in_list(["SEZ", "Overseas", "Deemed Export"], doc.gst_category)',
-				'options': '\nWith Payment of Tax\nWithout Payment of Tax',
-				'mandatory_depends_on': 'eval:in_list(["SEZ", "Overseas", "Deemed Export"], doc.gst_category)'
 			}
 		],
 		'Member': [

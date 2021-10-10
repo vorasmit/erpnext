@@ -158,11 +158,11 @@ def make_custom_fields(update=True):
 		dict(fieldname='gst_category', label='GST Category',
 			fieldtype='Select', insert_after='gst_section', print_hide=1,
 			options='\nRegistered Regular\nRegistered Composition\nUnregistered\nSEZ\nOverseas\nUIN Holders',
-			fetch_from='supplier.gst_category', fetch_if_empty=1),
+			fetch_from='supplier_address.gst_category', fetch_if_empty=1),
 		dict(fieldname='export_type', label='Export Type',
 			fieldtype='Select', insert_after='gst_category', print_hide=1,
 			depends_on='eval:in_list(["SEZ", "Overseas"], doc.gst_category)',
-			options='\nWith Payment of Tax\nWithout Payment of Tax', fetch_from='supplier.export_type',
+			options='\nWith Payment of Tax\nWithout Payment of Tax', fetch_from='supplier_address.export_type',
 			fetch_if_empty=1),
 	]
 
@@ -172,11 +172,11 @@ def make_custom_fields(update=True):
 		dict(fieldname='gst_category', label='GST Category',
 			fieldtype='Select', insert_after='gst_section', print_hide=1,
 			options='\nRegistered Regular\nRegistered Composition\nUnregistered\nSEZ\nOverseas\nConsumer\nDeemed Export\nUIN Holders',
-			fetch_from='customer.gst_category', fetch_if_empty=1),
+			fetch_from='customer_address.gst_category', fetch_if_empty=1),
 		dict(fieldname='export_type', label='Export Type',
 			fieldtype='Select', insert_after='gst_category', print_hide=1,
 			depends_on='eval:in_list(["SEZ", "Overseas", "Deemed Export"], doc.gst_category)',
-			options='\nWith Payment of Tax\nWithout Payment of Tax', fetch_from='customer.export_type',
+			options='\nWith Payment of Tax\nWithout Payment of Tax', fetch_from='customer_address.export_type',
 			fetch_if_empty=1),
 	]
 
@@ -184,7 +184,7 @@ def make_custom_fields(update=True):
 		dict(fieldname='gst_category', label='GST Category',
 			fieldtype='Select', insert_after='gst_vehicle_type', print_hide=1,
 			options='\nRegistered Regular\nRegistered Composition\nUnregistered\nSEZ\nOverseas\nConsumer\nDeemed Export\nUIN Holders',
-			fetch_from='customer.gst_category', fetch_if_empty=1),
+			fetch_from='customer_address.gst_category', fetch_if_empty=1),
 	]
 
 	invoice_gst_fields = [

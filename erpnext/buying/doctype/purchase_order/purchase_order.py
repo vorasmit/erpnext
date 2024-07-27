@@ -895,7 +895,7 @@ def get_mapped_subcontracting_order(source_name, target_doc=None):
 			"Purchase Order": {
 				"doctype": "Subcontracting Order",
 				"field_map": {},
-				"field_no_map": ["total_qty", "total", "net_total"],
+				"field_no_map": ["total_qty", "total", "net_total", "taxes_and_charges"],
 				"validation": {
 					"docstatus": ["=", 1],
 				},

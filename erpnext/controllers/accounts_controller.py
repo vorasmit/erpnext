@@ -464,7 +464,10 @@ class AccountsController(TransactionBase):
 			).run()
 
 	def on_trash(self):
-		from erpnext.accounts.utils import delete_exchange_gain_loss_journal
+		from erpnext.accounts.utils import (
+			delete_cross_account_bridge_journal,
+			delete_exchange_gain_loss_journal,
+		)
 
 		self._remove_references_in_repost_doctypes()
 		self._remove_references_in_unreconcile()
@@ -474,6 +477,8 @@ class AccountsController(TransactionBase):
 		if frappe.get_single_value("Accounts Settings", "delete_linked_ledger_entries"):
 			# delete linked exchange gain/loss journal
 			delete_exchange_gain_loss_journal(self)
+			# delete the (already-cancelled) cross-account reconcile bridge journal
+			delete_cross_account_bridge_journal(self)
 
 			ple = frappe.qb.DocType("Payment Ledger Entry")
 			frappe.qb.from_(ple).delete().where(
@@ -1783,8 +1788,6 @@ class AccountsController(TransactionBase):
 				gain_loss_to_book = [x for x in self.references if x.exchange_gain_loss != 0]
 				booked = []
 				if gain_loss_to_book:
-					[x.reference_doctype for x in gain_loss_to_book]
-					[x.reference_name for x in gain_loss_to_book]
 					je = qb.DocType("Journal Entry")
 					jea = qb.DocType("Journal Entry Account")
 					parents = (
@@ -1800,6 +1803,11 @@ class AccountsController(TransactionBase):
 
 					booked = []
 					if parents:
+						# `reference_detail_no` on the FX JE's JEA carries the
+						# `Payment Entry Reference.name` (stable across re-saves
+						# and idx renumbering by `clear_unallocated_reference_document_rows`).
+						# Phase 2.5 / Cluster A fix: dedupe on this stable id
+						# rather than the volatile child-row idx.
 						booked = (
 							qb.from_(je)
 							.inner_join(jea)
@@ -1808,15 +1816,17 @@ class AccountsController(TransactionBase):
 							.where(
 								(je.docstatus == 1)
 								& (je.name.isin(parents))
-								& (je.voucher_type == "Exchange Gain or Loss")
+								& (je.voucher_type == "Exchange Gain Or Loss")
 							)
 							.run()
 						)
 
 				for d in gain_loss_to_book:
-					# Filter out References for which Gain/Loss is already booked
+					# Filter out References for which Gain/Loss is already booked.
+					# Key on the PE.references row's stable `name`, not the volatile
+					# `idx` (renumbered by `clear_unallocated_reference_document_rows`).
 					if d.exchange_gain_loss and (
-						(d.reference_doctype, d.reference_name, str(d.idx)) not in booked
+						(d.reference_doctype, d.reference_name, d.name) not in booked
 					):
 						if self.book_advance_payments_in_separate_party_account:
 							party_account = d.account
@@ -1849,10 +1859,10 @@ class AccountsController(TransactionBase):
 							reverse_dr_or_cr,
 							d.reference_doctype,
 							d.reference_name,
-							d.idx,
+							d.name,
 							self.doctype,
 							self.name,
-							d.idx,
+							d.name,
 							self.cost_center,
 							dimensions_dict,
 							self.project,
@@ -1964,6 +1974,7 @@ class AccountsController(TransactionBase):
 		from erpnext.accounts.utils import (
 			cancel_common_party_journal,
 			cancel_exchange_gain_loss_journal,
+			cancel_linked_cross_account_bridges,
 			unlink_ref_doc_from_payment_entries,
 		)
 
@@ -1971,6 +1982,10 @@ class AccountsController(TransactionBase):
 
 		if self.doctype in ["Sales Invoice", "Purchase Invoice", "Payment Entry", "Journal Entry"]:
 			self.cancel_system_generated_credit_debit_notes()
+
+			# A cross-account reconcile bridge JE exists only to settle this voucher;
+			# unwind it before the rest of the cancel flow.
+			cancel_linked_cross_account_bridges(self)
 
 			# Cancel Exchange Gain/Loss Journal before unlinking
 			cancel_exchange_gain_loss_journal(self)

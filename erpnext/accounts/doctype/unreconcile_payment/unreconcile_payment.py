@@ -11,6 +11,7 @@ from frappe.query_builder.functions import Abs, Sum
 from frappe.utils.data import comma_and
 
 from erpnext.accounts.utils import (
+	cancel_cross_account_bridge_journal,
 	cancel_exchange_gain_loss_journal,
 	unlink_ref_doc_from_payment_entries,
 	update_voucher_outstanding,
@@ -60,6 +61,11 @@ class UnreconcilePayment(Document):
 		# todo: more granular unreconciliation
 		for alloc in self.allocations:
 			doc = frappe.get_doc(alloc.reference_doctype, alloc.reference_name)
+
+			if cancel_cross_account_bridge_journal(doc, self.voucher_type, self.voucher_no):
+				frappe.db.set_value("Unreconcile Payment Entries", alloc.name, "unlinked", True)
+				continue
+
 			unlink_ref_doc_from_payment_entries(doc, self.voucher_no)
 			cancel_exchange_gain_loss_journal(doc, self.voucher_type, self.voucher_no)
 

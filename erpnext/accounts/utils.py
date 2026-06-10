@@ -526,20 +526,26 @@ def reconcile_against_document(
 		frappe.flags.ignore_party_validation = True
 
 		reposting_rows = []
-		for entry in entries:
-			check_if_advance_entry_modified(entry)
-			validate_allocated_amount(entry)
 
-			dimensions_dict = _build_dimensions_dict_for_exc_gain_loss(entry, active_dimensions)
+		if voucher_type == "Journal Entry":
+			for entry in entries:
+				check_if_advance_entry_modified(entry)
+				validate_allocated_amount(entry)
 
-			if voucher_type == "Journal Entry":
-				referenced_row = update_reference_in_journal_entry(entry, doc, do_not_save=False)
-				# advance section in sales/purchase invoice and reconciliation tool,both pass on exchange gain/loss
-				# amount and account in args
-				# referenced_row is used to deduplicate gain/loss journal
-				entry.update({"referenced_row": referenced_row.name})
+			referenced_rows_by_entry = _apply_jea_splits_for_je(doc, entries)
+
+			for entry in entries:
+				ref_row = referenced_rows_by_entry[id(entry)]
+				entry.update({"referenced_row": ref_row.name})
+				dimensions_dict = _build_dimensions_dict_for_exc_gain_loss(entry, active_dimensions)
 				doc.make_exchange_gain_loss_journal([entry], dimensions_dict)
-			else:
+		else:
+			for entry in entries:
+				check_if_advance_entry_modified(entry)
+				validate_allocated_amount(entry)
+
+				dimensions_dict = _build_dimensions_dict_for_exc_gain_loss(entry, active_dimensions)
+
 				referenced_row = update_reference_in_payment_entry(
 					entry,
 					doc,
@@ -552,7 +558,7 @@ def reconcile_against_document(
 
 				reposting_rows.append(referenced_row)
 
-		doc.save(ignore_permissions=True)
+			doc.save(ignore_permissions=True)
 
 		if voucher_type == "Payment Entry" and doc.book_advance_payments_in_separate_party_account:
 			for row in reposting_rows:
@@ -659,6 +665,109 @@ def validate_allocated_amount(args):
 		throw(_("Allocated amount cannot be greater than unadjusted amount"))
 
 
+def _apply_jea_splits_for_je(je_doc, entries):
+	"""Apply all JEA splits for a single JE in one pass.
+
+	Cluster C fix: the legacy per-allocation loop calls
+	`update_reference_in_journal_entry` N times against the same JEA, each
+	call reading `entry.unadjusted_amount` (captured at PR fetch time =
+	original JEA amount) — but the JEA's remainder shrinks after each prior
+	call, so the second iteration writes back the wrong remainder and the JE
+	saves with debit ≠ credit. Pre-grouping by JEA and computing the full
+	split set up-front mutates each JEA exactly once.
+
+	Steps per JEA group:
+	  1. Read the active side (Dr/Cr) off the JEA itself, not the caller's
+	     party-wide dr_or_cr guess, and sign the allocations to match it.
+	  2. Compute remainder = original - sum(signed allocated). Either rewrite the
+	     original row to the remainder, or remove it entirely if remainder=0.
+	  3. Append one new JEA row per allocation, carrying through fields and
+	     setting `reference_type` / `reference_name`.
+
+	Returns `{id(entry): new_jea_row}` so the caller can set
+	`entry.referenced_row` for FX JE dedupe.
+	"""
+	jea_to_entries = {}
+	for entry in entries:
+		jea_to_entries.setdefault(entry["voucher_detail_no"], []).append(entry)
+
+	referenced_rows = {}
+
+	for jea_name, jea_entries in jea_to_entries.items():
+		jv_detail = je_doc.get("accounts", {"name": jea_name})[0]
+
+		# Step 1: operate on whichever column the JEA actually carries its value.
+		# A party leg is legitimately bookable on EITHER side for one party —
+		# a payment-like JE fills Dr (Dr Creditors), an invoice-like JE fills Cr
+		# (Cr Creditors) — so the caller's party-wide `dr_or_cr` is right only
+		# half the time. The old code "flipped + negated allocated_amount" when
+		# the guess was wrong, then computed `remainder = original - (-alloc)
+		# = original + alloc`, DOUBLING the leg (1000 -> 2000) instead of
+		# settling it. Reading the active side off the JEA removes the guess.
+		if flt(jv_detail.debit_in_account_currency):
+			active_field, base_field = "debit_in_account_currency", "debit"
+			opp_field, opp_base_field = "credit_in_account_currency", "credit"
+		else:
+			active_field, base_field = "credit_in_account_currency", "credit"
+			opp_field, opp_base_field = "debit_in_account_currency", "debit"
+
+		original_amount = flt(jv_detail.get(active_field))
+		# Allocations arrive as positive magnitudes; place them on the active
+		# field with the SAME sign as the original leg, so a leg booked as a
+		# negative (e.g. Dr -100, the "negative debit" payment convention) still
+		# nets to a balanced split.
+		sign = -1 if original_amount < 0 else 1
+		exchange_rate = flt(jv_detail.exchange_rate)
+		for entry in jea_entries:
+			entry["dr_or_cr"] = active_field
+			entry["signed_allocated"] = sign * abs(flt(entry["allocated_amount"]))
+
+		# Step 2: remainder of the original row after all allocations.
+		total_allocated = sum(e["signed_allocated"] for e in jea_entries)
+		remainder = original_amount - total_allocated
+
+		insert_position = -1
+		precision = je_doc.precision(active_field, jv_detail)
+		if flt(remainder, precision) != 0:
+			jv_detail.set(active_field, remainder)
+			jv_detail.set(base_field, remainder * exchange_rate)
+		else:
+			je_doc.remove(jv_detail)
+			insert_position += jv_detail.idx
+
+		# Step 3: one new JEA row per allocation.
+		fieldnames = frappe.get_meta("Journal Entry Account").get_fieldnames_with_value()
+		for entry in jea_entries:
+			new_row = je_doc.append("accounts", position=insert_position)
+			for field in fieldnames:
+				new_row.set(field, jv_detail.get(field))
+
+			alloc = entry["signed_allocated"]
+			new_row.set(active_field, alloc)
+			new_row.set(base_field, alloc * exchange_rate)
+			new_row.set(opp_field, 0)
+			new_row.set(opp_base_field, 0)
+
+			new_row.set("reference_type", entry["against_voucher_type"])
+			new_row.set("reference_name", entry["against_voucher"])
+			new_row.against_account = cstr(jv_detail.against_account)
+			new_row.is_advance = cstr(jv_detail.is_advance)
+			new_row.docstatus = 1
+
+			if jv_detail.get("reference_type") in get_advance_payment_doctypes():
+				new_row.advance_voucher_type = jv_detail.get("reference_type")
+				new_row.advance_voucher_no = jv_detail.get("reference_name")
+
+			referenced_rows[id(entry)] = new_row
+
+	je_doc.flags.ignore_validate_update_after_submit = True
+	je_doc.flags.ignore_reposting_on_reconciliation = True
+	je_doc.save(ignore_permissions=True)
+
+	return referenced_rows
+
+
+# TODO: remove this, not used.
 def update_reference_in_journal_entry(d, journal_entry, do_not_save=False):
 	"""
 	Updates against document, if partial amount splits into rows
@@ -837,81 +946,226 @@ def get_reconciliation_effect_date(against_voucher_type, against_voucher, compan
 	return reconcile_on
 
 
+def act_on_linked_exchange_gain_loss_journal(
+	parent_doc: dict | object,
+	action: str,
+	referenced_dt: str | None = None,
+	referenced_dn: str | None = None,
+) -> None:
+	"""Cancel (`action="cancel"`) or delete (`action="delete"`) the system Exchange
+	Gain/Loss JEs linked to `parent_doc`. When `referenced_dt`/`referenced_dn` are
+	given, act only on the JE that references BOTH `parent_doc` and that voucher.
+	"""
+	if parent_doc.doctype not in ["Sales Invoice", "Purchase Invoice", "Payment Entry", "Journal Entry"]:
+		return
+
+	je_docstatus = 1 if action == "cancel" else 2
+	for name in get_linked_exchange_gain_loss_journal(
+		referenced_dt=parent_doc.doctype, referenced_dn=parent_doc.name, je_docstatus=je_docstatus
+	):
+		gain_loss_je = frappe.get_doc("Journal Entry", name)
+		if referenced_dt and referenced_dn:
+			references = [(x.reference_type, x.reference_name) for x in gain_loss_je.accounts]
+			if not (
+				len(references) == 2
+				and (referenced_dt, referenced_dn) in references
+				and (parent_doc.doctype, parent_doc.name) in references
+			):
+				continue
+		getattr(gain_loss_je, action)()
+
+
 def cancel_exchange_gain_loss_journal(
 	parent_doc: dict | object, referenced_dt: str | None = None, referenced_dn: str | None = None
 ) -> None:
-	"""
-	Cancel Exchange Gain/Loss for Sales/Purchase Invoice, if they have any.
-	"""
-	if parent_doc.doctype in ["Sales Invoice", "Purchase Invoice", "Payment Entry", "Journal Entry"]:
-		gain_loss_journals = get_linked_exchange_gain_loss_journal(
-			referenced_dt=parent_doc.doctype, referenced_dn=parent_doc.name, je_docstatus=1
+	"""Cancel Exchange Gain/Loss for Sales/Purchase Invoice, if they have any."""
+	act_on_linked_exchange_gain_loss_journal(parent_doc, "cancel", referenced_dt, referenced_dn)
+
+
+# Dedicated voucher_type for the system Journal Entry that bridges a cross-account
+# reconciliation (see ReconcileRouter._bridge_cross_account). Tagged
+# so the unreconcile flow can identify and fully unwind it.
+CROSS_ACCOUNT_BRIDGE_VOUCHER_TYPE = "Reconciliation Journal"
+
+
+def _is_cross_account_bridge_je(name: str | None, docstatus: int = 1) -> bool:
+	if not name:
+		return False
+	vtype, current_docstatus = frappe.db.get_value("Journal Entry", name, ["voucher_type", "docstatus"]) or (
+		None,
+		None,
+	)
+	return vtype == CROSS_ACCOUNT_BRIDGE_VOUCHER_TYPE and current_docstatus == docstatus
+
+
+def _linked_cross_account_bridges(doc: object, docstatus: int) -> set:
+	"""Bridge JEs at `docstatus` linked to `doc` — either referencing it (invoice
+	side) or referenced by it (when `doc` is the advance JE)."""
+	bridges = set(
+		get_linked_system_journals(doc.doctype, doc.name, CROSS_ACCOUNT_BRIDGE_VOUCHER_TYPE, docstatus)
+	)
+	# When doc is the advance side it REFERENCES the bridge (a JE via its JEA, a PE
+	# via its Payment Entry Reference). Its own rows may already be at a later
+	# docstatus mid-cancel, so don't filter them — only re-check the bridge.
+	if doc.doctype == "Journal Entry":
+		refs = frappe.db.get_all(
+			"Journal Entry Account",
+			filters={"parent": doc.name, "reference_type": "Journal Entry"},
+			pluck="reference_name",
 		)
-		for doc in gain_loss_journals:
-			gain_loss_je = frappe.get_doc("Journal Entry", doc)
-			if referenced_dt and referenced_dn:
-				references = [(x.reference_type, x.reference_name) for x in gain_loss_je.accounts]
-				if (
-					len(references) == 2
-					and (referenced_dt, referenced_dn) in references
-					and (parent_doc.doctype, parent_doc.name) in references
-				):
-					# only cancel JE generated against parent_doc and referenced_dn
-					gain_loss_je.cancel()
-			else:
-				gain_loss_je.cancel()
+	elif doc.doctype == "Payment Entry":
+		refs = frappe.db.get_all(
+			"Payment Entry Reference",
+			filters={"parent": doc.name, "reference_doctype": "Journal Entry"},
+			pluck="reference_name",
+		)
+	else:
+		refs = []
+	for ref in refs:
+		if _is_cross_account_bridge_je(ref, docstatus):
+			bridges.add(ref)
+	return bridges
+
+
+def _unwind_cross_account_bridge(bridge: str) -> None:
+	"""Fully reverse a cross-account bridge JE: unlink every voucher that
+	references it (the advance/JE side), cancel it (reverses its GL, restoring the
+	invoice side), and recompute outstanding on every involved voucher."""
+	# 1. The "referrer" side — vouchers whose JEA references the bridge. Capture
+	#    each party leg (account/party) BEFORE nulling the link so outstanding can
+	#    be recomputed afterwards. Exclude the system FX gain/loss JE: it references
+	#    the bridge too, but must stay linked so the bridge's own on_cancel
+	#    (`cancel_exchange_gain_loss_journal`) cascades and cancels it.
+	referrer_legs = [
+		leg
+		for leg in frappe.db.get_all(
+			"Journal Entry Account",
+			filters={"reference_type": "Journal Entry", "reference_name": bridge, "docstatus": 1},
+			fields=["parent", "account", "party_type", "party"],
+		)
+		if leg.parent != bridge
+		and frappe.db.get_value("Journal Entry", leg.parent, "voucher_type") != "Exchange Gain Or Loss"
+	]
+	for leg in referrer_legs:
+		remove_ref_doc_link_from_jv("Journal Entry", bridge, leg.parent)
+		update_accounting_ledgers_after_reference_removal("Journal Entry", bridge, leg.parent)
+
+	# 1b. Payment Entries reference the bridge via Payment Entry Reference (not a
+	#     JEA); unlink those too. `remove_ref_doc_link_from_pe` re-runs the PE's
+	#     set_amounts / GL, so its outstanding is restored here.
+	pe_referrers = frappe.db.get_all(
+		"Payment Entry Reference",
+		filters={
+			"reference_doctype": "Journal Entry",
+			"reference_name": bridge,
+			"docstatus": 1,
+			"parenttype": "Payment Entry",
+		},
+		pluck="parent",
+	)
+	for pe in set(pe_referrers):
+		remove_ref_doc_link_from_pe("Journal Entry", bridge, pe)
+
+	# 2. The "referenced" side — vouchers the bridge itself points at (invoices /
+	#    JEs). Captured for outstanding refresh after the bridge is cancelled.
+	bridge_doc = frappe.get_doc("Journal Entry", bridge)
+	referenced_legs = [
+		(a.reference_type, a.reference_name, a.account, a.party_type, a.party)
+		for a in bridge_doc.accounts
+		if a.reference_name
+	]
+
+	# 3. Cancel the bridge — reverses its GL and delinks its PLE. The flag stops
+	#    its own on_cancel hook from recursing back into the unwind.
+	bridge_doc.flags.ignore_links = True
+	bridge_doc.flags.ignore_cross_account_unwind = True
+	bridge_doc.cancel()
+
+	# 4. Restore outstanding on both sides.
+	for leg in referrer_legs:
+		update_voucher_outstanding("Journal Entry", leg.parent, leg.account, leg.party_type, leg.party)
+	for ref_type, ref_name, account, party_type, party in referenced_legs:
+		if party_type and party:
+			update_voucher_outstanding(ref_type, ref_name, account, party_type, party)
+
+
+def cancel_cross_account_bridge_journal(
+	parent_doc: dict | object, referenced_dt: str | None = None, referenced_dn: str | None = None
+) -> bool:
+	"""Unwind a cross-account bridge during UNRECONCILE.
+
+	A cross-account reconcile mints a system transfer JE (`voucher_type =
+	CROSS_ACCOUNT_BRIDGE_VOUCHER_TYPE`) that settles BOTH vouchers across two party
+	accounts. Unlinking one side (the default unreconcile behaviour) would leave
+	the transfer half-applied, so when the unreconciled voucher IS the bridge — or
+	the bridge is the counterpart — unwind it whole. Returns True if a bridge was
+	unwound (caller then skips the default unlink for this allocation).
+	"""
+	for candidate in (referenced_dn, getattr(parent_doc, "name", None)):
+		if _is_cross_account_bridge_je(candidate):
+			_unwind_cross_account_bridge(candidate)
+			return True
+	return False
+
+
+def cancel_linked_cross_account_bridges(doc: object) -> None:
+	"""On direct cancellation of an invoice / JE, cancel any cross-account bridge
+	JE created solely to reconcile it (the bridge has no meaning once a side is
+	cancelled). Mirrors `cancel_system_generated_credit_debit_notes`.
+	"""
+	if getattr(doc, "flags", None) and doc.flags.get("ignore_cross_account_unwind"):
+		return
+	# The bridge itself being cancelled — nothing to unwind, just let it cancel.
+	if doc.doctype == "Journal Entry" and _is_cross_account_bridge_je(doc.name):
+		return
+
+	for bridge in _linked_cross_account_bridges(doc, docstatus=1):
+		_unwind_cross_account_bridge(bridge)
+
+
+def delete_cross_account_bridge_journal(doc: object) -> None:
+	"""On deletion of an invoice / JE, delete the CANCELLED bridge JE(s) created to
+	reconcile it. Mirrors `delete_exchange_gain_loss_journal` (on_trash flow)."""
+	for bridge in _linked_cross_account_bridges(doc, docstatus=2):
+		frappe.delete_doc("Journal Entry", bridge, force=1, ignore_permissions=True)
 
 
 def delete_exchange_gain_loss_journal(
 	parent_doc: dict | object, referenced_dt: str | None = None, referenced_dn: str | None = None
 ) -> None:
+	"""Delete Exchange Gain/Loss for Sales/Purchase Invoice, if they have any."""
+	act_on_linked_exchange_gain_loss_journal(parent_doc, "delete", referenced_dt, referenced_dn)
+
+
+def get_linked_system_journals(
+	referenced_dt: str, referenced_dn: str, voucher_type: str, docstatus: int = 1
+) -> list:
+	"""System-generated Journal Entries of `voucher_type` whose JEA references
+	(`referenced_dt`, `referenced_dn`), at `docstatus`. One batched query — shared
+	by the exchange-gain/loss and cross-account-bridge lookups.
 	"""
-	Delete Exchange Gain/Loss for Sales/Purchase Invoice, if they have any.
-	"""
-	if parent_doc.doctype in ["Sales Invoice", "Purchase Invoice", "Payment Entry", "Journal Entry"]:
-		gain_loss_journals = get_linked_exchange_gain_loss_journal(
-			referenced_dt=parent_doc.doctype, referenced_dn=parent_doc.name, je_docstatus=2
-		)
-		for doc in gain_loss_journals:
-			gain_loss_je = frappe.get_doc("Journal Entry", doc)
-			if referenced_dt and referenced_dn:
-				references = [(x.reference_type, x.reference_name) for x in gain_loss_je.accounts]
-				if (
-					len(references) == 2
-					and (referenced_dt, referenced_dn) in references
-					and (parent_doc.doctype, parent_doc.name) in references
-				):
-					# only delete JE generated against parent_doc and referenced_dn
-					gain_loss_je.delete()
-			else:
-				gain_loss_je.delete()
+	parents = frappe.db.get_all(
+		"Journal Entry Account",
+		{"reference_type": referenced_dt, "reference_name": referenced_dn, "docstatus": docstatus},
+		pluck="parent",
+	)
+	if not parents:
+		return []
+	return frappe.db.get_all(
+		"Journal Entry",
+		{
+			"name": ["in", parents],
+			"voucher_type": voucher_type,
+			"is_system_generated": 1,
+			"docstatus": docstatus,
+		},
+		pluck="name",
+	)
 
 
 def get_linked_exchange_gain_loss_journal(referenced_dt: str, referenced_dn: str, je_docstatus: int) -> list:
-	"""
-	Get all the linked exchange gain/loss journal entries for a given document.
-	"""
-	gain_loss_journals = []
-	if journals := frappe.db.get_all(
-		"Journal Entry Account",
-		{
-			"reference_type": referenced_dt,
-			"reference_name": referenced_dn,
-			"docstatus": je_docstatus,
-		},
-		pluck="parent",
-	):
-		gain_loss_journals = frappe.db.get_all(
-			"Journal Entry",
-			{
-				"name": ["in", journals],
-				"voucher_type": "Exchange Gain Or Loss",
-				"is_system_generated": 1,
-				"docstatus": je_docstatus,
-			},
-			pluck="name",
-		)
-	return gain_loss_journals
+	"""Get all the linked exchange gain/loss journal entries for a given document."""
+	return get_linked_system_journals(referenced_dt, referenced_dn, "Exchange Gain Or Loss", je_docstatus)
 
 
 def cancel_common_party_journal(self):
